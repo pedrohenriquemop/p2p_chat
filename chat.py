@@ -2,7 +2,7 @@ import argparse
 import struct
 import socket
 from enum import Enum
-from typing import List, Literal
+from typing import List, Literal, Tuple
 import threading
 import time
 
@@ -13,9 +13,9 @@ class Utils:
     @staticmethod
     def get_message_type_from_code(code: int) -> str:
         try:
-            return MessageCode(code)
+            return MessageCode(code).name
         except ValueError:
-            raise ValueError(f"Unknown message code: {hex(code)}")
+            raise ValueError(f"Unknown message code: {code}")
 
 
 class MessageCode(Enum):
@@ -25,7 +25,7 @@ class MessageCode(Enum):
     ARCHIVE_RESPONSE = 0x4
 
     def __str__(self):
-        return self.value
+        return str(self.value)
 
 
 class RequestType:
@@ -123,40 +123,132 @@ class P2PChatEngine:
         self.port = port
 
         self.sock = None
+        self.lock = threading.Lock()
+        self.server_thread = None
+        self.sender_thread = None
+        self.active_connections = {}
 
     def start(self):
         print(f"Starting P2P Chat Engine on {self.ip}:{self.port}")
 
-        addrinfo = socket.getaddrinfo(self.ip, None)
-        family = addrinfo[0][0]
-        self.sock = socket.socket(family, socket.SOCK_STREAM)
+        addrinfo = socket.getaddrinfo(
+            self.ip, self.port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+        )
+        family, socktype, proto, canonname, sa = addrinfo[0]
+        self.sock = socket.socket(family, socktype, proto)
+        self.sock.settimeout(1.0)
+        self.sock.bind(sa)
+        self.sock.listen(5)  # max pending connections
 
-        self.lock = threading.Lock()
+        self.server_thread = threading.Thread(
+            target=self.__connections_handler, daemon=True
+        )
+        self.server_thread.start()
 
-        threading.Thread(target=self.__listener, daemon=True).start()
-        threading.Thread(target=self.__sender, daemon=True).start()
+        self.sender_thread = threading.Thread(target=self.__sender, daemon=True)
+        self.sender_thread.start()
 
-    def __listener(self):
+        self.__start_cli()
+
+    def __connections_handler(self):
+        print("Listening for incoming connections...")
+
         while True:
-            byte = self.sock.recv(1)
+            try:
+                conn, addr = self.sock.accept()
+                print(f"Accepted connection from {addr}")
 
-            print(f"Received byte: {byte.hex()}")
-            type_ = Utils.get_message_type_from_code(byte[0])
-            print(f"Message type: {type_}")
+                with self.lock:
+                    self.active_connections[addr] = conn
+
+                listener_thread = threading.Thread(
+                    target=self.__listener, args=(conn, addr), daemon=True
+                )
+                listener_thread.start()
+
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"Error accepting connection: {e}")
+
+    def __listener(self, conn_sock: socket, addr: Tuple[str, int]):
+        try:
+            while True:
+                header_byte = conn_sock.recv(1)
+
+                print(f"Received byte: {header_byte[0]}")
+                message_type = Utils.get_message_type_from_code(header_byte[0])
+                print(f"Message type: {message_type}")
+        except Exception as e:
+            print(f"Error in listener for {addr}: {e}")
+        finally:
+            conn_sock.close()
+            if addr in self.active_connections:
+                del self.active_connections[addr]
 
     def __sender(self):
         while True:
             with self.lock:
                 try:
-                    request = Request(MessageCode.PEER_REQUEST)
-                    packed_request = request.pack()
-
-                    print(f"Sending request: {packed_request.hex()}")
-
-                    self.sock.sendall(packed_request)
+                    if self.active_connections:
+                        for peer_addr, peer_conn in self.active_connections.items():
+                            try:
+                                request = Request(MessageCode.PEER_REQUEST)
+                                peer_conn.sendall(request.pack())
+                                print(f"Sent {request.type} to {peer_addr}")
+                            except Exception as e:
+                                print(f"Error sending to {peer_addr}: {e}")
                 except Exception as e:
-                    print(f"Error: {e}")
-            time.sleep(1)
+                    print(f"Error in sender: {e}")
+            time.sleep(10)
+
+    def connect_to_peer(self, peer_ip: str):
+        if not peer_ip:
+            raise ValueError("Peer IP cannot be empty")
+
+        if peer_ip == self.ip:
+            raise Exception("Cannot connect to self")
+
+        try:
+            print(f"Connecting to peer: {peer_ip}:{PORT}")
+            peer_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            peer_sock.connect((peer_ip, PORT))
+            print(f"Connected to {peer_ip}:{PORT}")
+            self.active_connections[(peer_ip, PORT)] = peer_sock
+
+            threading.Thread(
+                target=self.__listener, args=(peer_sock, (peer_ip, PORT)), daemon=True
+            ).start()
+            return True
+        except Exception as e:
+            print(f"Could not connect to peer {peer_ip}:{PORT}: {e}")
+            return False
+
+    def __start_cli(self):
+        accepted_connects = ["connect", "conn", "con", "c"]
+
+        command = input()
+
+        while command.lower() != "exit":
+            try:
+                command = command.lower().strip()
+                start = command.split(" ")[0]
+                if start in accepted_connects:
+                    peer_ip = command.split(" ")[1]
+                    self.connect_to_peer(peer_ip)
+                else:
+                    print(
+                        f"Unknown command. Use '[{', '.join(accepted_connects)}] <ip>' to connect to a peer."
+                    )
+
+                command = input()
+            except KeyboardInterrupt:
+                print("\nExiting CLI...")
+                self.sock.close()
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+                command = input()
 
 
 def main():
@@ -171,6 +263,8 @@ def main():
     engine = P2PChatEngine(ip, PORT)
 
     engine.start()
+
+    print("Program terminated.")
 
 
 if __name__ == "__main__":
