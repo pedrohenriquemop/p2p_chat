@@ -7,6 +7,8 @@ import threading
 import time
 
 PORT = 51511
+HASH_LENGTH = 16
+PEER_REQUEST_INTERVAL = 5
 
 
 class Utils:
@@ -44,11 +46,11 @@ class Chat:
         if len(message) != size:
             raise ValueError("Message length does not match size")
 
-        if len(rand) != 16:
-            raise ValueError("Random value must be 16 bytes long")
+        if len(rand) != HASH_LENGTH:
+            raise ValueError(f"Random value must be {HASH_LENGTH} bytes long")
 
-        if len(md5_hash) != 16:
-            raise ValueError("Hash value must be 16 bytes long")
+        if len(md5_hash) != HASH_LENGTH:
+            raise ValueError(f"Hash value must be {HASH_LENGTH} bytes long")
 
         self.size = size
         self.message = message
@@ -58,7 +60,11 @@ class Chat:
     def pack(self) -> bytes:
         message_bytes = self.message.encode("ascii")
         return struct.pack(
-            f"!B{self.size}s16s16s", self.size, message_bytes, self.rand, self.md5_hash
+            f"!B{self.size}s{HASH_LENGTH}s{HASH_LENGTH}s",
+            self.size,
+            message_bytes,
+            self.rand,
+            self.md5_hash,
         )
 
     @classmethod
@@ -67,16 +73,30 @@ class Chat:
             raise ValueError("Data too short for Chat unpacking")
 
         size = data[0]
-        message, rand, md5_hash = struct.unpack(f"!{size}s16s16s", data[1 : 33 + size])
+        message, rand, md5_hash = struct.unpack(
+            f"!{size}s{HASH_LENGTH}s{HASH_LENGTH}s", data[1 : 33 + size]
+        )
         message = message.decode("ascii")
 
         return cls(size, message, rand, md5_hash)
 
 
-class Request:
-    def __init__(self, code: RequestType):
+class GeneralRequest:
+    def __init__(self, code: MessageCode):
         self.code = code
         self.type = code.name
+
+    def pack(self):
+        raise NotImplementedError("Pack is not implemented")
+
+    @classmethod
+    def unpack(cls, data: bytes):
+        raise NotImplementedError("Unpack is not implemented")
+
+
+class PeerRequest(GeneralRequest):
+    def __init__(self):
+        super().__init__(MessageCode.PEER_REQUEST)
 
     def pack(self):
         return struct.pack("!B", self.code.value)
@@ -90,23 +110,12 @@ class Request:
         return cls(code)
 
 
-class Response:
-    def __init__(
-        self, code: ResponseType, chat_amount: int = 0, chats: List[Chat] = []
-    ):
-        self.code = code
-        self.type = code.name
-
-        if chat_amount != len(chats):
-            raise ValueError("chat_amount does not match the number of chats provided")
-
-        self.chat_amount = chat_amount
-        self.chats = chats
+class ArchiveRequest(GeneralRequest):
+    def __init__(self):
+        super().__init__(MessageCode.ARCHIVE_REQUEST)
 
     def pack(self):
-        return struct.pack("!BI", self.code.value) + b"".join(
-            chat.pack() for chat in self.chats
-        )
+        return struct.pack("!B", self.code.value)
 
     @classmethod
     def unpack(cls, data: bytes):
@@ -115,6 +124,91 @@ class Response:
 
         code = RequestType(data[0])
         return cls(code)
+
+
+class GeneralResponse:
+    def __init__(self, code: ResponseType):
+        self.code = code
+        self.type = code.name
+
+    def pack(self):
+        raise NotImplementedError("Pack is not implemented")
+
+    @classmethod
+    def unpack(cls, data: bytes):
+        raise NotImplementedError("Unpack is not implemented")
+
+
+class PeerList(GeneralResponse):
+    def __init__(self, known_peers_amount: int, known_peers: List[str]):
+        super().__init__(MessageCode.PEER_RESPONSE)
+
+        if known_peers_amount != len(known_peers):
+            raise ValueError(
+                "Known peers amount does not match the number of peers provided"
+            )
+
+        self.known_peers_amount = known_peers_amount
+        self.known_peers = known_peers
+
+    def pack(self):
+        return struct.pack("!BI", self.code.value, self.known_peers_amount) + b"".join(
+            struct.pack("!I", peer) for peer in self.known_peers
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes):
+        if len(data) < 5:
+            raise ValueError("Invalid data size for PeerList unpacking")
+
+        _, known_peers_amount = struct.unpack("!BI", data[:5])
+        if len(data) != 5 + known_peers_amount * 4:
+            raise ValueError("Data size does not match known peers amount")
+
+        known_peers = []
+
+        for i in range(known_peers_amount):
+            start = 5 + i * 4
+            end = start + 4
+            peer = struct.unpack("!I", data[start:end])[0]
+            known_peers.append(peer)
+
+        return cls(known_peers_amount, known_peers)
+
+
+class ArchiveResponse(GeneralResponse):
+    def __init__(self, chat_amount: int = 0, chats: List[Chat] = []):
+        super().__init__(MessageCode.PEER_RESPONSE)
+
+        if chat_amount != len(chats):
+            raise ValueError("chat_amount does not match the number of chats provided")
+
+        self.chat_amount = chat_amount
+        self.chats = chats
+
+    def pack(self):
+        return struct.pack("!BI", self.code.value, self.chat_amount) + b"".join(
+            chat.pack() for chat in self.chats
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes):
+        if len(data) < 5:
+            raise ValueError("Invalid data size for ArchiveResponse unpacking")
+
+        _, chat_amount = struct.unpack("!BI", data[:5])
+        if len(data) != 5 + chat_amount * (1 + HASH_LENGTH + HASH_LENGTH + 1):
+            raise ValueError("Data size does not match chat amount")
+
+        chats = []
+        offset = 5
+        for _ in range(chat_amount):
+            chat_data = data[offset:]
+            chat = Chat.unpack(chat_data)
+            chats.append(chat)
+            offset += 1 + chat.size + HASH_LENGTH + HASH_LENGTH
+
+        return cls(chat_amount, chats)
 
 
 class P2PChatEngine:
@@ -126,7 +220,7 @@ class P2PChatEngine:
         self.lock = threading.Lock()
         self.server_thread = None
         self.sender_thread = None
-        self.active_connections = {}
+        self.active_connections: dict[str, Tuple[str, int]] = {}
 
     def start(self):
         print(f"Starting P2P Chat Engine on {self.ip}:{self.port}")
@@ -179,8 +273,17 @@ class P2PChatEngine:
                 print(f"Received byte: {header_byte[0]}")
                 message_type = Utils.get_message_type_from_code(header_byte[0])
                 print(f"Message type: {message_type}")
+
+                if message_type == MessageCode.PEER_REQUEST.name:
+                    peer_response = PeerList(
+                        known_peers_amount=len(self.active_connections),
+                        known_peers=list(self.active_connections.keys()),
+                    )
+                    conn_sock.sendall(peer_response.pack())
         except Exception as e:
-            print(f"Error in listener for {addr}: {e}")
+            print(
+                f"Error in listener for {addr}: {e}"
+            )
         finally:
             conn_sock.close()
             if addr in self.active_connections:
@@ -193,14 +296,14 @@ class P2PChatEngine:
                     if self.active_connections:
                         for peer_addr, peer_conn in self.active_connections.items():
                             try:
-                                request = Request(MessageCode.PEER_REQUEST)
+                                request = PeerRequest()
                                 peer_conn.sendall(request.pack())
                                 print(f"Sent {request.type} to {peer_addr}")
                             except Exception as e:
                                 print(f"Error sending to {peer_addr}: {e}")
                 except Exception as e:
                     print(f"Error in sender: {e}")
-            time.sleep(10)
+            time.sleep(PEER_REQUEST_INTERVAL)
 
     def connect_to_peer(self, peer_ip: str):
         if not peer_ip:
