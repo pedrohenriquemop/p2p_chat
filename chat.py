@@ -365,7 +365,18 @@ class P2PChatEngine:
             return False
 
     def __start_cli(self):
-        accepted_connects = ["connect", "conn", "con", "c"]
+        commands = [
+            {
+                "description": "connect to a peer",
+                "accepted": ["connect", "conn", "con", "c"],
+                "args": ["ip"],
+            },
+            {
+                "description": "list known peers",
+                "accepted": ["list", "l", "peers", "p"],
+                "args": [],
+            },
+        ]
 
         command = input()
 
@@ -373,13 +384,26 @@ class P2PChatEngine:
             try:
                 command = command.lower().strip()
                 start = command.split(" ")[0]
-                if start in accepted_connects:
+
+                was_accepted = False
+
+                # connect command
+                if start in commands[0]["accepted"]:
                     peer_ip = command.split(" ")[1]
                     self.connect_to_peer(peer_ip)
-                else:
-                    print(
-                        f"Unknown command. Use '[{', '.join(accepted_connects)}] <ip>' to connect to a peer."
-                    )
+                    was_accepted = True
+
+                # list command
+                if start in commands[1]["accepted"]:
+                    print(f"Known peers: {list(self.active_connections.keys())}")
+                    was_accepted = True
+
+                if not was_accepted:
+                    print("Unknown command. Use:")
+                    for cmd in commands:
+                        print(
+                            f"> [{', '.join(cmd['accepted'])}]{'' if not len(cmd['args']) else ' ' + ' '.join(map(lambda x: f'<{x}>', cmd['args']))} to {cmd['description']}"
+                        )
 
                 command = input()
             except KeyboardInterrupt:
