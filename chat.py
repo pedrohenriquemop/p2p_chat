@@ -1,4 +1,5 @@
 import argparse
+import os
 import struct
 import socket
 from enum import Enum
@@ -6,10 +7,14 @@ from typing import List, Literal, Tuple
 import threading
 import time
 import traceback
+import hashlib
 
 PORT = 51511
 HASH_LENGTH = 16
 PEER_REQUEST_INTERVAL = 5
+
+# TODOS:
+# [ ] chat classes are created. Now, it is necessary to integrate them into the engine
 
 
 class Utils:
@@ -40,46 +45,179 @@ class ResponseType:
 
 
 class Chat:
-    def __init__(self, size: int, message: str, rand: bytes, md5_hash: bytes):
-        if size > 255:
-            raise ValueError("Size must be less than or equal to 255")
+    def __init__(
+        self,
+        message: str,
+        chat_history: "ChatHistory",
+        rand: bytes = None,
+        md5_hash: bytes = None,
+    ):
+        self.size = len(message)
 
-        if len(message) != size:
-            raise ValueError("Message length does not match size")
+        if not (0 <= self.size <= 255):
+            raise ValueError("Message length (size) must be between 0 and 255.")
 
-        if len(rand) != HASH_LENGTH:
-            raise ValueError(f"Random value must be {HASH_LENGTH} bytes long")
+        if not message.encode("ascii").isalnum() and message != "":
+            raise ValueError("Chat message must contain only alphanumeric characters.")
 
-        if len(md5_hash) != HASH_LENGTH:
-            raise ValueError(f"Hash value must be {HASH_LENGTH} bytes long")
+        try:
+            self._message_bytes = message.encode("ascii")
+            self.message = message
+        except UnicodeEncodeError:
+            raise ValueError("Chat message must be ASCII.")
 
-        self.size = size
-        self.message = message
-        self.rand = rand
-        self.md5_hash = md5_hash
+        if rand is not None and md5_hash is not None:
+            if len(rand) != HASH_LENGTH:
+                raise ValueError(
+                    f"Provided random value must be {HASH_LENGTH} bytes long."
+                )
+            if len(md5_hash) != HASH_LENGTH:
+                raise ValueError(f"Provided MD5 hash must be {HASH_LENGTH} bytes long.")
+            self.rand = rand
+            self.md5_hash = md5_hash
+        else:
+            self.rand, self.md5_hash = chat_history.mine_chat_hash(self)
 
     def pack(self) -> bytes:
-        message_bytes = self.message.encode("ascii")
         return struct.pack(
             f"!B{self.size}s{HASH_LENGTH}s{HASH_LENGTH}s",
             self.size,
-            message_bytes,
+            self._message_bytes,
             self.rand,
             self.md5_hash,
         )
 
     @classmethod
-    def unpack(cls, data: bytes):
-        if len(data) < 37:
-            raise ValueError("Data too short for Chat unpacking")
+    def unpack(cls, data: bytes) -> "Chat":
+        if len(data) < (1 + 0 + HASH_LENGTH + HASH_LENGTH):
+            raise ValueError("Data too short for Chat unpacking.")
 
         size = data[0]
-        message, rand, md5_hash = struct.unpack(
-            f"!{size}s{HASH_LENGTH}s{HASH_LENGTH}s", data[1 : 33 + size]
-        )
-        message = message.decode("ascii")
 
-        return cls(size, message, rand, md5_hash)
+        expected_total_len = 1 + size + HASH_LENGTH + HASH_LENGTH
+        if len(data) < expected_total_len:
+            raise ValueError(
+                f"Data incomplete for chat message. Expected {expected_total_len} bytes, got {len(data)}."
+            )
+
+        unpacked_tuple = struct.unpack(
+            f"!{size}s{HASH_LENGTH}s{HASH_LENGTH}s", data[1:expected_total_len]
+        )
+
+        message_bytes = unpacked_tuple[0]
+        rand_bytes = unpacked_tuple[1]
+        md5_hash_bytes = unpacked_tuple[2]
+
+        message_str = message_bytes.decode("ascii")
+
+        return cls(message_str, None, rand=rand_bytes, md5_hash=md5_hash_bytes)
+
+    def __repr__(self):
+        return (
+            f"Chat(size={self.size}, message='{self.message}', "
+            f"rand={self.rand.hex()}, md5_hash={self.md5_hash.hex()})"
+        )
+
+    def __eq__(self, other):
+        if not isinstance(other, Chat):
+            return NotImplemented
+        return (
+            self.size == other.size
+            and self.message == other.message
+            and self.rand == other.rand
+            and self.md5_hash == other.md5_hash
+        )
+
+
+class ChatHistory:
+    def __init__(self, chats: List["Chat"]):
+        self.history = chats
+
+    def add_chat_in_history(self, chat: Chat):
+        if not isinstance(chat, Chat):
+            raise TypeError("chat must be an instance of Chat")
+
+        if not self.verify_chat_validity(chat):
+            raise ValueError(
+                "Chat is not valid for history based on mining criteria or hash chain."
+            )
+
+        self.history.append(chat)
+
+    def verify_chat_validity(self, chat: Chat) -> bool:
+        s_sequence_bytes = self._get_s_sequence(chat, for_mining=False)
+        calculated_md5 = hashlib.md5(s_sequence_bytes).digest()
+
+        if not calculated_md5.startswith(b"\x00\x00"):
+            return False
+
+        if chat.md5_hash != calculated_md5:
+            return False
+
+        return True
+
+    def _get_s_sequence(self, chat: Chat, for_mining: bool = False) -> bytes:
+        temp_history_for_s = list(self.history)
+
+        temp_chat_for_s = Chat(
+            message=chat.message,
+            chat_history=self,
+            rand=chat.rand,
+            md5_hash=b"\x00" * HASH_LENGTH if for_mining else chat.md5_hash,
+        )
+
+        temp_history_for_s.append(temp_chat_for_s)
+
+        start_index = max(0, len(temp_history_for_s) - 20)
+        relevant_chats = temp_history_for_s[start_index:]
+
+        s_bytes = b""
+        for c in relevant_chats:
+            s_bytes += c.pack()
+
+        return s_bytes[:-HASH_LENGTH]
+
+    def mine_chat_hash(self, chat_to_mine: Chat) -> Tuple[bytes, bytes]:
+        attempts = 0
+        MINING_ATTEMPTS_LIMIT = 1_000_000
+
+        while attempts < MINING_ATTEMPTS_LIMIT:
+            current_rand = os.urandom(HASH_LENGTH)
+            chat_to_mine.rand = current_rand
+
+            s_sequence_bytes = self._get_s_sequence(chat_to_mine, for_mining=True)
+            calculated_md5 = hashlib.md5(s_sequence_bytes).digest()
+
+            if calculated_md5.startswith(b"\x00\x00"):
+                return current_rand, calculated_md5
+
+            attempts += 1
+
+        raise RuntimeError(f"Mining failed after {MINING_ATTEMPTS_LIMIT} attempts.")
+
+    def verify_history(self) -> bool:
+        if not self.history:
+            return True
+
+        for i in range(len(self.history)):
+            current_chat = self.history[i]
+
+            temp_history_for_s_calc = ChatHistory(self.history[:i])
+            s_sequence_bytes = temp_history_for_s_calc._get_s_sequence(
+                current_chat, for_mining=False
+            )
+            calculated_hash_for_s = hashlib.md5(s_sequence_bytes).digest()
+
+            if not current_chat.md5_hash.startswith(b"\x00\x00"):
+                return False
+
+            if current_chat.md5_hash != calculated_hash_for_s:
+                return False
+
+        return True
+
+    def __repr__(self):
+        return f"ChatHistory(chats_count={len(self.history)})"
 
 
 class GeneralRequest:
