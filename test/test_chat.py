@@ -1,7 +1,8 @@
 import unittest
 import os
+import struct
 import hashlib
-from chat import Chat, ChatHistory, HASH_LENGTH  # Import from your classes file
+from chat import Chat, ChatHistory, HASH_LENGTH
 
 
 class TestChat(unittest.TestCase):
@@ -11,20 +12,25 @@ class TestChat(unittest.TestCase):
 
     def test_chat_initialization(self):
         message = "TestMessage"
-        rand_val = os.urandom(HASH_LENGTH)
+        verifier_code_val = os.urandom(HASH_LENGTH)
         md5_hash_val = os.urandom(HASH_LENGTH)
 
-        chat = Chat(message, self.initial_history, rand=rand_val, md5_hash=md5_hash_val)
+        chat = Chat(
+            message,
+            self.initial_history,
+            verifier_code=verifier_code_val,
+            md5_hash=md5_hash_val,
+        )
         self.assertEqual(chat.size, len(message))
         self.assertEqual(chat.message, message)
-        self.assertEqual(chat.rand, rand_val)
+        self.assertEqual(chat.verifier_code, verifier_code_val)
         self.assertEqual(chat.md5_hash, md5_hash_val)
 
         message_mine = "MiningChat"
         mined_chat = Chat(message_mine, self.initial_history)
         self.assertEqual(mined_chat.size, len(message_mine))
         self.assertEqual(mined_chat.message, message_mine)
-        self.assertEqual(len(mined_chat.rand), HASH_LENGTH)
+        self.assertEqual(len(mined_chat.verifier_code), HASH_LENGTH)
         self.assertEqual(len(mined_chat.md5_hash), HASH_LENGTH)
         self.assertTrue(mined_chat.md5_hash.startswith(b"\x00\x00"))
 
@@ -32,9 +38,9 @@ class TestChat(unittest.TestCase):
         with self.assertRaises(ValueError):
             Chat("A" * 256, self.initial_history)
 
-    def test_chat_initialization_non_alphanumeric(self):
+    def test_chat_initialization_non_ascii(self):
         with self.assertRaises(ValueError):
-            Chat("Hello!", self.initial_history)
+            Chat("Olá, mundo!", self.initial_history)  # 'á' is not ASCII
 
     def test_chat_pack_unpack(self):
         message = "PackUnpackTest"
@@ -53,7 +59,7 @@ class TestChat(unittest.TestCase):
 
     def test_chat_unpack_incomplete_message_data(self):
         message_len = 10
-        incomplete_data = b"\x0aabcdefghij"
+        incomplete_data = struct.pack(f"!B{message_len}s", message_len, b"abcdefghij")
         with self.assertRaises(ValueError):
             Chat.unpack(incomplete_data)
 
@@ -83,10 +89,13 @@ class TestChatHistory(unittest.TestCase):
             self.history.add_chat_in_history("not a chat object")
 
     def test_add_chat_in_history_invalid_chat(self):
-        invalid_rand = os.urandom(HASH_LENGTH)
+        invalid_verifier_code = os.urandom(HASH_LENGTH)
         invalid_hash = b"\x01\x01" + os.urandom(HASH_LENGTH - 2)
         invalid_chat = Chat(
-            "InvalidChat", self.history, rand=invalid_rand, md5_hash=invalid_hash
+            "InvalidChat",
+            self.history,
+            verifier_code=invalid_verifier_code,
+            md5_hash=invalid_hash,
         )
 
         with self.assertRaises(ValueError):
@@ -109,11 +118,15 @@ class TestChatHistory(unittest.TestCase):
 
         self.assertFalse(tampered_history.verify_history())
 
-    def test_verify_history_tampered_rand(self):
+    def test_verify_history_tampered_verifier_code(
+        self,
+    ):
         tampered_history = ChatHistory(chats=list(self.history.history))
 
         tampered_chat_idx = 1
-        tampered_history.history[tampered_chat_idx].rand = os.urandom(HASH_LENGTH)
+        tampered_history.history[tampered_chat_idx].verifier_code = os.urandom(
+            HASH_LENGTH
+        )
 
         self.assertFalse(tampered_history.verify_history())
 
@@ -146,12 +159,12 @@ class TestChatHistory(unittest.TestCase):
         temp_chat = Chat(
             message,
             self.history,
-            rand=b"\x00" * HASH_LENGTH,
+            verifier_code=b"\x00" * HASH_LENGTH,
             md5_hash=b"\x00" * HASH_LENGTH,
         )
 
-        rand, md5_hash = self.history.mine_chat_hash(temp_chat)
-        self.assertEqual(len(rand), HASH_LENGTH)
+        verifier_code, md5_hash = self.history.mine_chat_hash(temp_chat)
+        self.assertEqual(len(verifier_code), HASH_LENGTH)
         self.assertEqual(len(md5_hash), HASH_LENGTH)
         self.assertTrue(md5_hash.startswith(b"\x00\x00"))
 
