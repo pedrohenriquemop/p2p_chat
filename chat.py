@@ -13,9 +13,6 @@ PORT = 51511
 HASH_LENGTH = 16
 PEER_REQUEST_INTERVAL = 5
 
-# TODOS:
-# [ ] chat classes are created. Now, it is necessary to integrate them into the engine
-
 
 class Utils:
     @staticmethod
@@ -49,7 +46,7 @@ class Chat:
         self,
         message: str,
         chat_history: "ChatHistory",
-        rand: bytes = None,
+        verifier_code: bytes = None,
         md5_hash: bytes = None,
     ):
         self.size = len(message)
@@ -57,8 +54,8 @@ class Chat:
         if not (0 <= self.size <= 255):
             raise ValueError("Message length (size) must be between 0 and 255.")
 
-        if not message.encode("ascii").isalnum() and message != "":
-            raise ValueError("Chat message must contain only alphanumeric characters.")
+        if not message.encode("ascii").isascii() and message != "":
+            raise ValueError("Chat message must contain only ascii characters.")
 
         try:
             self._message_bytes = message.encode("ascii")
@@ -66,30 +63,30 @@ class Chat:
         except UnicodeEncodeError:
             raise ValueError("Chat message must be ASCII.")
 
-        if rand is not None and md5_hash is not None:
-            if len(rand) != HASH_LENGTH:
+        if verifier_code is not None and md5_hash is not None:
+            if len(verifier_code) != HASH_LENGTH:
                 raise ValueError(
-                    f"Provided random value must be {HASH_LENGTH} bytes long."
+                    f"Provided verifier_code must be {HASH_LENGTH} bytes long."
                 )
             if len(md5_hash) != HASH_LENGTH:
                 raise ValueError(f"Provided MD5 hash must be {HASH_LENGTH} bytes long.")
-            self.rand = rand
+            self.verifier_code = verifier_code
             self.md5_hash = md5_hash
         else:
-            self.rand, self.md5_hash = chat_history.mine_chat_hash(self)
+            self.verifier_code, self.md5_hash = chat_history.mine_chat_hash(self)
 
     def pack(self) -> bytes:
         return struct.pack(
             f"!B{self.size}s{HASH_LENGTH}s{HASH_LENGTH}s",
             self.size,
             self._message_bytes,
-            self.rand,
+            self.verifier_code,
             self.md5_hash,
         )
 
     @classmethod
     def unpack(cls, data: bytes) -> "Chat":
-        if len(data) < (1 + 0 + HASH_LENGTH + HASH_LENGTH):
+        if len(data) < (1 + HASH_LENGTH + HASH_LENGTH):
             raise ValueError("Data too short for Chat unpacking.")
 
         size = data[0]
@@ -105,17 +102,22 @@ class Chat:
         )
 
         message_bytes = unpacked_tuple[0]
-        rand_bytes = unpacked_tuple[1]
+        verifier_code_bytes = unpacked_tuple[1]
         md5_hash_bytes = unpacked_tuple[2]
 
         message_str = message_bytes.decode("ascii")
 
-        return cls(message_str, None, rand=rand_bytes, md5_hash=md5_hash_bytes)
+        return cls(
+            message_str,
+            None,
+            verifier_code=verifier_code_bytes,
+            md5_hash=md5_hash_bytes,
+        )
 
     def __repr__(self):
         return (
             f"Chat(size={self.size}, message='{self.message}', "
-            f"rand={self.rand.hex()}, md5_hash={self.md5_hash.hex()})"
+            f"verifier_code={self.verifier_code.hex()}, md5_hash={self.md5_hash.hex()})"
         )
 
     def __eq__(self, other):
@@ -124,7 +126,7 @@ class Chat:
         return (
             self.size == other.size
             and self.message == other.message
-            and self.rand == other.rand
+            and self.verifier_code == other.verifier_code
             and self.md5_hash == other.md5_hash
         )
 
@@ -162,7 +164,7 @@ class ChatHistory:
         temp_chat_for_s = Chat(
             message=chat.message,
             chat_history=self,
-            rand=chat.rand,
+            verifier_code=chat.verifier_code,
             md5_hash=b"\x00" * HASH_LENGTH if for_mining else chat.md5_hash,
         )
 
@@ -179,17 +181,17 @@ class ChatHistory:
 
     def mine_chat_hash(self, chat_to_mine: Chat) -> Tuple[bytes, bytes]:
         attempts = 0
-        MINING_ATTEMPTS_LIMIT = 1_000_000
+        MINING_ATTEMPTS_LIMIT = 2_000_000
 
         while attempts < MINING_ATTEMPTS_LIMIT:
-            current_rand = os.urandom(HASH_LENGTH)
-            chat_to_mine.rand = current_rand
+            current_verifier_code = os.urandom(HASH_LENGTH)
+            chat_to_mine.verifier_code = current_verifier_code
 
             s_sequence_bytes = self._get_s_sequence(chat_to_mine, for_mining=True)
             calculated_md5 = hashlib.md5(s_sequence_bytes).digest()
 
             if calculated_md5.startswith(b"\x00\x00"):
-                return current_rand, calculated_md5
+                return current_verifier_code, calculated_md5
 
             attempts += 1
 
@@ -215,6 +217,9 @@ class ChatHistory:
                 return False
 
         return True
+
+    def history_count(self) -> int:
+        return len(self.history)
 
     def __repr__(self):
         return f"ChatHistory(chats_count={len(self.history)})"
@@ -242,11 +247,16 @@ class PeerRequest(GeneralRequest):
 
     @classmethod
     def unpack(cls, data: bytes):
-        if len(data) < 1 or len(data) > 1:
-            raise ValueError("Invalid data size for Request unpacking")
+        if len(data) != 1:
+            raise ValueError("Invalid data size for PeerRequest unpacking")
 
-        code = RequestType(data[0])
-        return cls(code)
+        code_val = data[0]
+        if code_val != MessageCode.PEER_REQUEST.value:
+            raise ValueError(
+                f"PeerRequest code mismatch. Expected {MessageCode.PEER_REQUEST.value}, got {code_val}."
+            )
+
+        return cls()
 
 
 class ArchiveRequest(GeneralRequest):
@@ -258,15 +268,20 @@ class ArchiveRequest(GeneralRequest):
 
     @classmethod
     def unpack(cls, data: bytes):
-        if len(data) < 1 or len(data) > 1:
-            raise ValueError("Invalid data size for Request unpacking")
+        if len(data) != 1:
+            raise ValueError("Invalid data size for ArchiveRequest unpacking")
 
-        code = RequestType(data[0])
-        return cls(code)
+        code_val = data[0]
+        if code_val != MessageCode.ARCHIVE_REQUEST.value:
+            raise ValueError(
+                f"ArchiveRequest code mismatch. Expected {MessageCode.ARCHIVE_REQUEST.value}, got {code_val}."
+            )
+
+        return cls()
 
 
 class GeneralResponse:
-    def __init__(self, code: ResponseType):
+    def __init__(self, code: MessageCode):
         self.code = code
         self.type = code.name
 
@@ -293,6 +308,7 @@ class PeerList(GeneralResponse):
     def pack(self):
         packed_code = struct.pack("!B", self.code.value)
         packed_amount = struct.pack("!I", self.known_peers_amount)
+
         packed_peers_data = b"".join(
             socket.inet_aton(peer_ip) for peer_ip, _ in self.known_peers
         )
@@ -317,7 +333,7 @@ class PeerList(GeneralResponse):
                 f"Data size ({len(data)}) does not match expected size ({expected_total_size}) based on known peers amount ({known_peers_amount})."
             )
 
-        unpacked_peers_list: List[str] = []
+        unpacked_peers_list: List[Tuple[str, int]] = []
 
         for i in range(known_peers_amount):
             start = 5 + i * 4
@@ -332,50 +348,52 @@ class PeerList(GeneralResponse):
 
 
 class ArchiveResponse(GeneralResponse):
-    def __init__(self, chat_amount: int = 0, chats: List[Chat] = []):
-        super().__init__(MessageCode.PEER_RESPONSE)
-
-        if chat_amount != len(chats):
-            raise ValueError("chat_amount does not match the number of chats provided")
-
-        self.chat_amount = chat_amount
+    def __init__(self, chats: List[Chat]):
+        super().__init__(MessageCode.ARCHIVE_RESPONSE)
         self.chats = chats
+        self.chat_amount = len(chats)
 
     def pack(self):
-        return struct.pack("!BI", self.code.value, self.chat_amount) + b"".join(
-            chat.pack() for chat in self.chats
-        )
+        header = struct.pack("!BI", self.code.value, self.chat_amount)
+        chats_data = b"".join(chat.pack() for chat in self.chats)
+        return header + chats_data
 
     @classmethod
-    def unpack(cls, data: bytes):
+    def unpack(cls, data: bytes) -> "ArchiveResponse":
         if len(data) < 5:
             raise ValueError("Invalid data size for ArchiveResponse unpacking")
 
-        _, chat_amount = struct.unpack("!BI", data[:5])
-        if len(data) != 5 + chat_amount * (1 + HASH_LENGTH + HASH_LENGTH + 1):
-            raise ValueError("Data size does not match chat amount")
+        code_value, chat_amount = struct.unpack("!BI", data[:5])
+        if code_value != MessageCode.ARCHIVE_RESPONSE.value:
+            raise ValueError(
+                f"Message code mismatch for ArchiveResponse. Expected {MessageCode.ARCHIVE_RESPONSE.value}, got {code_value}."
+            )
 
-        chats = []
+        unpacked_chats: List[Chat] = []
         offset = 5
         for _ in range(chat_amount):
-            chat_data = data[offset:]
-            chat = Chat.unpack(chat_data)
-            chats.append(chat)
+            if offset >= len(data):
+                raise ValueError(
+                    f"Not enough data to unpack chat {len(unpacked_chats) + 1} of {chat_amount}."
+                )
+
+            chat = Chat.unpack(data[offset:])
+            unpacked_chats.append(chat)
             offset += 1 + chat.size + HASH_LENGTH + HASH_LENGTH
 
-        return cls(chat_amount, chats)
+        return cls(chats=unpacked_chats)
 
 
 class P2PChatEngine:
     def __init__(self, ip, port):
         self.ip = ip
         self.port = port
-
         self.sock = None
         self.lock = threading.Lock()
         self.server_thread = None
         self.sender_thread = None
         self.active_connections: dict[Tuple[str, int], socket.socket] = {}
+        self.chat_history = ChatHistory(chats=[])
 
     def start(self):
         print(f"Starting P2P Chat Engine on {self.ip}:{self.port}")
@@ -386,8 +404,15 @@ class P2PChatEngine:
         family, socktype, proto, canonname, sa = addrinfo[0]
         self.sock = socket.socket(family, socktype, proto)
         self.sock.settimeout(1.0)
-        self.sock.bind(sa)
-        self.sock.listen(5)  # max pending connections
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        try:
+            self.sock.bind(sa)
+            self.sock.listen(5)
+            print(f"Listening on {self.ip}:{self.port}")
+        except OSError as e:
+            print(f"Error binding socket to {self.ip}:{self.port}: {e}")
+            return
 
         self.server_thread = threading.Thread(
             target=self.__connections_handler, daemon=True
@@ -420,64 +445,170 @@ class P2PChatEngine:
             except Exception as e:
                 print(f"Error accepting connection: {e}")
 
-    def __listener(self, conn_sock: socket, addr: Tuple[str, int]):
+    def __listener(self, conn_sock: socket.socket, addr: Tuple[str, int]):
         try:
             while True:
                 header_byte = conn_sock.recv(1)
+                if not header_byte:
+                    print(f"Connection closed by {addr}")
+                    break
 
-                message_type = Utils.get_message_type_from_code(header_byte[0])
-                print(f"> Received message type: {message_type}")
+                message_code_int = header_byte[0]
+                message_type = Utils.get_message_type_from_code(message_code_int)
+                # print(f"> Received message type: {message_type} from {addr}")
 
                 if message_type == MessageCode.PEER_REQUEST.name:
                     peer_response = PeerList(
                         known_peers_amount=len(self.active_connections),
                         known_peers=list(self.active_connections.keys()),
                     )
-                    conn_sock.sendall(peer_response.pack())
+                    packed_response = peer_response.pack()
+                    conn_sock.sendall(packed_response)
+                    # print(f"> Sent PeerList to {addr}: {packed_response.hex()}")
 
-                if message_type == MessageCode.PEER_RESPONSE.name:
-                    length = conn_sock.recv(4)
-                    if len(length) < 4:
-                        print("> Received incomplete length for PeerList")
-                        continue
-                    known_peers_amount = struct.unpack("!I", length)[0]
-                    peers_data = conn_sock.recv(known_peers_amount * 4)
-                    if len(peers_data) < known_peers_amount * 4:
-                        print("> Received incomplete peer data")
-                        continue
+                elif message_type == MessageCode.PEER_RESPONSE.name:
+                    length_bytes = self.__recv_all(conn_sock, 4)
+                    if not length_bytes:
+                        break
+
+                    known_peers_amount = struct.unpack("!I", length_bytes)[0]
+                    peers_data = self.__recv_all(conn_sock, known_peers_amount * 4)
+                    if not peers_data:
+                        break
+
                     peer_list_response = PeerList.unpack(
-                        header_byte + length + peers_data
+                        header_byte + length_bytes + peers_data
                     )
-                    print("> Received PeerList:", peer_list_response.known_peers)
+                    # print(
+                    #     f"> Received PeerList from {addr}: {peer_list_response.known_peers}"
+                    # )
 
                     for peer_ip, _ in peer_list_response.known_peers:
-                        if self.ip != peer_ip and peer_ip not in [
-                            key[0] for key in self.active_connections.keys()
-                        ]:
+                        if (
+                            peer_ip != self.ip
+                            and (peer_ip, PORT) not in self.active_connections
+                        ):
                             self.connect_to_peer(peer_ip)
+
+                elif message_type == MessageCode.ARCHIVE_REQUEST.name:
+                    archive_response = ArchiveResponse(chats=self.chat_history.history)
+                    packed_response = archive_response.pack()
+                    conn_sock.sendall(packed_response)
+                    print(
+                        f"> Sent ArchiveResponse to {addr} with {self.chat_history.history_count()} chats."
+                    )
+
+                elif message_type == MessageCode.ARCHIVE_RESPONSE.name:
+                    length_bytes = self.__recv_all(conn_sock, 4)
+                    if not length_bytes:
+                        break
+
+                    chat_amount = struct.unpack("!I", length_bytes)[0]
+
+                    unpacked_chats: List[Chat] = []
+                    for _ in range(chat_amount):
+                        chat_size_byte = self.__recv_all(conn_sock, 1)
+                        if not chat_size_byte:
+                            print(
+                                f"> Received incomplete chat data (missing N) from {addr}. Breaking."
+                            )
+                            break
+                        current_chat_N = chat_size_byte[0]
+
+                        # 1 (for N) + N (message bytes) + 16 (verifier_code) + 16 (md5_hash)
+                        expected_chat_data_len = (
+                            current_chat_N + HASH_LENGTH * 2
+                        )  # N + 16 + 16 = N + 32 bytes for the rest
+
+                        remaining_chat_data = self.__recv_all(
+                            conn_sock, expected_chat_data_len
+                        )
+                        if not remaining_chat_data:
+                            print(
+                                f"> Received incomplete chat data (body) from {addr}. Breaking."
+                            )
+                            break
+
+                        full_chat_packed_data = chat_size_byte + remaining_chat_data
+
+                        try:
+                            chat = Chat.unpack(full_chat_packed_data)
+                            unpacked_chats.append(chat)
+                        except ValueError as ve:
+                            print(
+                                f"> Error unpacking single chat from {addr}: {ve}. Skipping this chat."
+                            )
+
+                    if len(unpacked_chats) != chat_amount:
+                        print(
+                            f"> Warning: Unpacked {len(unpacked_chats)} chats, but expected {chat_amount} from {addr}. History might be incomplete/corrupted."
+                        )
+
+                    if unpacked_chats:
+                        received_history_instance = ChatHistory(chats=unpacked_chats)
+                        if received_history_instance.verify_history():
+                            print("> Received history verified correctly.")
+                            if (
+                                received_history_instance.history_count()
+                                > self.chat_history.history_count()
+                            ):
+                                print(
+                                    "> New history is longer. Replacing current history."
+                                )
+                                self.chat_history = received_history_instance
+                            else:
+                                print(
+                                    "> New history is not longer or equal. Keeping current history."
+                                )
+                        else:
+                            print("> Received history FAILED verification. Ignoring.")
+                    else:
+                        print(
+                            f"> No valid chats unpacked from ArchiveResponse from {addr}. Ignoring history."
+                        )
+
+                else:
+                    print(
+                        f"> Unknown message code {hex(message_code_int)} from {addr}. Ignoring."
+                    )
 
         except Exception as e:
             print(f"Error in listener for {addr}: {e}")
             traceback.print_stack()
         finally:
             conn_sock.close()
-            if addr in self.active_connections:
-                del self.active_connections[addr]
+            with self.lock:
+                if addr in self.active_connections:
+                    del self.active_connections[addr]
+
+    def __recv_all(self, sock: socket.socket, n_bytes: int) -> bytes:
+        data = b""
+        while len(data) < n_bytes:
+            packet = sock.recv(n_bytes - len(data))
+            if not packet:
+                return b""
+            data += packet
+        return data
 
     def __sender(self):
         while True:
             with self.lock:
-                try:
-                    if self.active_connections:
-                        for peer_addr, peer_conn in self.active_connections.items():
-                            try:
-                                request = PeerRequest()
-                                peer_conn.sendall(request.pack())
-                                print(f"Sent {request.type} to {peer_addr}")
-                            except Exception as e:
-                                print(f"Error sending to {peer_addr}: {e}")
-                except Exception as e:
-                    print(f"Error in sender: {e}")
+                connections_to_send = list(self.active_connections.items())
+
+            if not connections_to_send:
+                pass
+            else:
+                for peer_addr, peer_conn in connections_to_send:
+                    try:
+                        request = PeerRequest()
+                        packed_request = request.pack()
+                        peer_conn.sendall(packed_request)
+                    except Exception as e:
+                        print(f"Error sending to {peer_addr}: {e}")
+                        with self.lock:
+                            if peer_addr in self.active_connections:
+                                self.active_connections[peer_addr].close()
+                                del self.active_connections[peer_addr]
             time.sleep(PEER_REQUEST_INTERVAL)
 
     def connect_to_peer(self, peer_ip: str):
@@ -485,22 +616,89 @@ class P2PChatEngine:
             raise ValueError("Peer IP cannot be empty")
 
         if peer_ip == self.ip:
-            raise Exception("Cannot connect to self")
+            print("! Cannot connect to self. Skipping.")
+            return False
 
         try:
-            print(f"! Connecting to peer: {peer_ip}:{PORT}")
-            peer_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            peer_sock.connect((peer_ip, PORT))
-            print(f"Connected to {peer_ip}:{PORT}")
-            self.active_connections[(peer_ip, PORT)] = peer_sock
+            peer_addr = (peer_ip, PORT)
+            with self.lock:
+                if peer_addr in self.active_connections:
+                    return True
 
+            client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_sock.settimeout(5.0)
+            client_sock.connect(peer_addr)
+            print(f"! Connected to {peer_ip}:{PORT}")
+
+            with self.lock:
+                self.active_connections[peer_addr] = client_sock
             threading.Thread(
-                target=self.__listener, args=(peer_sock, (peer_ip, PORT)), daemon=True
+                target=self.__listener, args=(client_sock, peer_addr), daemon=True
             ).start()
             return True
         except Exception as e:
-            print(f"Could not connect to peer {peer_ip}:{PORT}: {e}")
+            print(f"! Could not connect to peer {peer_ip}:{PORT}: {e}")
             return False
+
+    def _send_archive_request_to_all(self):
+        with self.lock:
+            connections_to_send = list(self.active_connections.items())
+
+        if not connections_to_send:
+            print("No active connections to request archive from.")
+            return
+
+        request = ArchiveRequest()
+        packed_request = request.pack()
+        for peer_addr, peer_conn in connections_to_send:
+            try:
+                peer_conn.sendall(packed_request)
+                print(f"Sent ArchiveRequest to {peer_addr}")
+            except Exception as e:
+                print(f"Error sending ArchiveRequest to {peer_addr}: {e}")
+                with self.lock:
+                    if peer_addr in self.active_connections:
+                        self.active_connections[peer_addr].close()
+                        del self.active_connections[peer_addr]
+
+    def _send_chat_message_to_all(self, message: str):
+        try:
+            new_chat = Chat(message=message, chat_history=self.chat_history)
+            self.chat_history.add_chat_in_history(new_chat)
+            print(
+                f"Chat '{message}' mined and added to history. Hash: {new_chat.md5_hash.hex()}"
+            )
+
+            self._disseminate_history()
+        except ValueError as e:
+            print(f"Error creating chat: {e}")
+        except RuntimeError as e:
+            print(f"Mining failed: {e}")
+
+    def _disseminate_history(self):
+        with self.lock:
+            connections_to_send = list(self.active_connections.items())
+
+        if not connections_to_send:
+            print("No active connections to disseminate history to.")
+            return
+
+        archive_response = ArchiveResponse(chats=self.chat_history.history)
+        packed_response = archive_response.pack()
+        print(
+            f"Disseminating history ({self.chat_history.history_count()} chats). Packed size: {len(packed_response)} bytes."
+        )
+
+        for peer_addr, peer_conn in connections_to_send:
+            try:
+                peer_conn.sendall(packed_response)
+                print(f"Sent ArchiveResponse to {peer_addr}")
+            except Exception as e:
+                print(f"Error disseminating history to {peer_addr}: {e}")
+                with self.lock:
+                    if peer_addr in self.active_connections:
+                        self.active_connections[peer_addr].close()
+                        del self.active_connections[peer_addr]
 
     def __start_cli(self):
         commands = [
@@ -514,58 +712,104 @@ class P2PChatEngine:
                 "accepted": ["list", "l", "peers", "p"],
                 "args": [],
             },
+            {
+                "description": "send a chat message",
+                "accepted": ["send", "s", "message", "m"],
+                "args": ["message_text"],
+            },
+            {
+                "description": "show chat history",
+                "accepted": ["history", "h", "chats"],
+                "args": [],
+            },
+            {
+                "description": "request archive from peers",
+                "accepted": ["request_archive", "ra"],
+                "args": [],
+            },
         ]
 
-        command = input()
+        print("\n--- Commands ---")
+        for cmd in commands:
+            args_str = ""
+            if cmd["args"]:
+                args_str = " " + " ".join(map(lambda x: f"<{x}>", cmd["args"]))
+            print(f"> [{', '.join(cmd['accepted'])}]{args_str} to {cmd['description']}")
+        print("> [exit] to terminate the program")
+        print("----------------\n")
 
-        while command.lower() != "exit":
+        while True:
             try:
-                command = command.lower().strip()
-                start = command.split(" ")[0]
+                command_line = input("Enter command: ").strip()
+                if not command_line:
+                    continue
+
+                if command_line.lower() == "exit":
+                    print("Exiting CLI...")
+                    self.sock.close()
+                    break
+
+                parts = command_line.split(" ", 1)
+                cmd_verb = parts[0].lower()
+                cmd_args_str = parts[1] if len(parts) > 1 else ""
 
                 was_accepted = False
 
-                # connect command
-                if start in commands[0]["accepted"]:
-                    peer_ip = command.split(" ")[1]
-                    self.connect_to_peer(peer_ip)
+                if cmd_verb in commands[0]["accepted"]:  # connect
+                    self.connect_to_peer(cmd_args_str)
                     was_accepted = True
-
-                # list command
-                if start in commands[1]["accepted"]:
+                elif cmd_verb in commands[1]["accepted"]:  # list peers
                     print(f"Known peers: {list(self.active_connections.keys())}")
+                    was_accepted = True
+                elif cmd_verb in commands[2]["accepted"]:  # send message
+                    if cmd_args_str:
+                        self._send_chat_message_to_all(cmd_args_str)
+                    else:
+                        print("Error: Message text required for 'send' command.")
+                    was_accepted = True
+                elif cmd_verb in commands[3]["accepted"]:  # show history
+                    print("\n--- Chat History ---")
+                    if not self.chat_history.history:
+                        print("No chats in history yet.")
+                    else:
+                        for i, chat in enumerate(self.chat_history.history):
+                            print(
+                                f"[{i+1}] {chat.message} (Hash: {chat.md5_hash.hex()[:8]}...)"
+                            )
+                    print("--------------------\n")
+                    was_accepted = True
+                elif cmd_verb in commands[4]["accepted"]:  # request archive
+                    self._send_archive_request_to_all()
                     was_accepted = True
 
                 if not was_accepted:
-                    print("Unknown command. Use:")
+                    print("Unknown command. Use one of the following:")
                     for cmd in commands:
+                        args_str = ""
+                        if cmd["args"]:
+                            args_str = " " + " ".join(
+                                map(lambda x: f"<{x}>", cmd["args"])
+                            )
                         print(
-                            f"> [{', '.join(cmd['accepted'])}]{'' if not len(cmd['args']) else ' ' + ' '.join(map(lambda x: f'<{x}>', cmd['args']))} to {cmd['description']}"
+                            f"> [{', '.join(cmd['accepted'])}]{args_str} to {cmd['description']}"
                         )
 
-                command = input()
             except KeyboardInterrupt:
                 print("\nExiting CLI...")
                 self.sock.close()
                 break
             except Exception as e:
-                print(f"Error: {e}")
-                command = input()
+                print(f"Error processing command: {e}")
+                # traceback.print_exc()
 
 
 def main():
     parser = argparse.ArgumentParser(description="DCC Internet P2P Blockchain Chat CLI")
-
     parser.add_argument("ip", help="IP address of self.")
-
     args = parser.parse_args()
 
-    ip = args.ip
-
-    engine = P2PChatEngine(ip, PORT)
-
+    engine = P2PChatEngine(args.ip, PORT)
     engine.start()
-
     print("Program terminated.")
 
 
